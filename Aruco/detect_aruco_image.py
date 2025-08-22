@@ -53,6 +53,14 @@ def main():
     if img is None:
         raise SystemExit(f"Cannot read image: {args.image}")
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, binary=cv2.threshold(gray,180,255,cv2.THRESH_BINARY)
+    # show=cv2.equalizeHist(gray)
+    
+    scale = 0.3
+    show = cv2.resize(show, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    
+    cv2.imshow("ArUco Detection", show)
+    cv2.waitKey(0)
 
     corners, ids, rejected = detect_markers(gray, dictionary)
 

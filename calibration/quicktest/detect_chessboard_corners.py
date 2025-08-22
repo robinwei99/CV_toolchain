@@ -43,7 +43,7 @@ def detect(gray, pattern_size, prefer_sb=True):
     if prefer_sb and hasattr(cv2, 'findChessboardCornersSB'):
         try:
             ok, corners = cv2.findChessboardCornersSB(
-                gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE
+                gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE |  cv2.CALIB_CB_ACCURACY
             )
             if ok and corners is not None:
                 if corners.ndim == 2:

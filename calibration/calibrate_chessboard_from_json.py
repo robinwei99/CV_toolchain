@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 import sys
 import glob
+from typing import Iterator, Tuple, Optional, List
 
 import numpy as np
 import cv2
@@ -49,6 +50,39 @@ def collect_images(folder: str):
         paths.extend(sorted(glob.glob(str(Path(folder) / e))))
     return paths
 
+# --------------------------- Video utils ------------------------------------
+
+def iter_video_frames(video_path: str,
+                      start_frame: int = 0,
+                      end_frame: Optional[int] = None,
+                      frame_step: int = 1):
+    """Yield (frame_bgr, frame_index) from a video."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERR] Cannot open video: {video_path}")
+        return
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if end_frame is None or end_frame < 0:
+        end_frame = total - 1
+    start_frame = max(0, start_frame)
+    end_frame = max(start_frame, min(end_frame, total - 1)) if total > 0 else end_frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    idx = start_frame
+    while True:
+        if end_frame is not None and idx > end_frame:
+            break
+        ret, frame = cap.read()
+        if not ret:
+            break
+        yield frame, idx
+        if frame_step > 1:
+            next_pos = idx + frame_step
+            cap.set(cv2.CAP_PROP_POS_FRAMES, next_pos)
+            idx = next_pos
+        else:
+            idx += 1
+    cap.release()
+
 # --------------------------- Chessboard utils -------------------------------
 
 def make_object_points(nx_inner: int, ny_inner: int, square_mm: float):
@@ -64,7 +98,8 @@ def detect_chessboard(gray, pattern_size, use_classic=False):
     """Detect inner corners. Returns (ok, corners) with corners shape (N,1,2)."""
     if not use_classic and hasattr(cv2, "findChessboardCornersSB"):
         try:
-            ok, corners = cv2.findChessboardCornersSB(gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY)
+            ok, corners = cv2.findChessboardCornersSB(gray, pattern_size,
+                flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY)
             if ok:
                 return True, corners
         except TypeError:
@@ -80,34 +115,147 @@ def detect_chessboard(gray, pattern_size, use_classic=False):
 def subpix_refine(gray, corners):
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4)
     win = (11, 11)
-    zero_zone = (-1, -1)
-    cv2.cornerSubPix(gray, corners, win, zero_zone, criteria)
-    return corners
+    return cv2.cornerSubPix(gray, corners, win, (-1, -1), criteria)
 
-# --------------------------- Error metrics ----------------------------------
-
-def mean_reproj_error(objpoints_list, imgpoints_list, rvecs, tvecs, K, D):
-    tot_err2 = 0.0
-    tot_pts = 0
-    for objp, imgp, rvec, tvec in zip(objpoints_list, imgpoints_list, rvecs, tvecs):
+def mean_reproj_error(objpoints, imgpoints, rvecs, tvecs, K, D):
+    total_err = 0.0
+    total_pts = 0
+    for objp, imgp, rvec, tvec in zip(objpoints, imgpoints, rvecs, tvecs):
         proj, _ = cv2.projectPoints(objp, rvec, tvec, K, D)
         err = cv2.norm(imgp, proj, cv2.NORM_L2)
-        n = len(objp)
-        tot_err2 += (err * err)
-        tot_pts += n
-    if tot_pts == 0:
-        return float("nan")
-    return float(np.sqrt(tot_err2 / tot_pts))
+        total_err += err * err
+        total_pts += len(objp)
+    return np.sqrt(total_err / max(total_pts, 1))
 
-# ------------------------------- Main ---------------------------------------
+def per_image_errors(objpoints_list, imgpoints_list, rvecs, tvecs, K, D):
+    per_img_rms = []
+    for objp, imgp, rvec, tvec in zip(objpoints_list, imgpoints_list, rvecs, tvecs):
+        proj, _ = cv2.projectPoints(objp, rvec, tvec, K, D)
+        err = cv2.norm(imgp, proj, cv2.NORM_L2) / np.sqrt(len(objp))
+        per_img_rms.append(err)
+    return per_img_rms
+
+
+# --------------------------- Robust refinement ------------------------------
+
+def ransac_inliers_for_image(objp3d: np.ndarray,
+                             imgp: np.ndarray,
+                             K: np.ndarray,
+                             D: np.ndarray,
+                             reproj_thresh: float,
+                             confidence: float) -> Optional[np.ndarray]:
+    """
+    Run PnP RANSAC to select inlier correspondences for a single image.
+    Returns an index array of inliers (shape (M,)) or None if it fails.
+    """
+    # imgp: (N,1,2) -> (N,2)
+    pts2d = imgp.reshape(-1, 2).astype(np.float32)
+    pts3d = objp3d.reshape(-1, 3).astype(np.float32)
+
+    # OpenCV requires at least 6 points for robust PnP.
+    if len(pts2d) < 6:
+        return None
+
+    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+        pts3d, pts2d, K, D,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+        reprojectionError=float(reproj_thresh),
+        confidence=float(confidence),
+        iterationsCount=1000
+    )
+    if not ok or inliers is None or len(inliers) < 6:
+        return None
+
+    return inliers.ravel()
+
+
+def robust_refine_with_ransac(objpoints_list: List[np.ndarray],
+                              imgpoints_list: List[np.ndarray],
+                              image_size: Tuple[int, int],
+                              iters: int = 1,
+                              reproj_thresh: float = 3.0,
+                              confidence: float = 0.99,
+                              min_inlier_ratio: float = 0.5):
+    """
+    Perform an initial calibration, then iteratively remove outlier corners in
+    each image using PnP-RANSAC inlier sets, and re-calibrate.
+
+    Returns (rms, K, D, rvecs, tvecs, objpoints_refined, imgpoints_refined)
+    """
+    # 1) Initial calibration
+    flags = (cv2.CALIB_FIX_K2 |
+         cv2.CALIB_FIX_K3 |
+         cv2.CALIB_ZERO_TANGENT_DIST |
+         cv2.CALIB_FIX_K4 |
+         cv2.CALIB_FIX_K5 |
+         cv2.CALIB_FIX_K6)
+    rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
+        objpoints_list, imgpoints_list, image_size, None, None, flags=flags
+    )
+
+    cur_obj = objpoints_list
+    cur_img = imgpoints_list
+
+    for it in range(max(0, iters)):
+        new_obj = []
+        new_img = []
+        kept = 0
+        removed_pts = 0
+
+        for objp, imgp in zip(cur_obj, cur_img):
+            inlier_idx = ransac_inliers_for_image(objp, imgp, K, D, reproj_thresh, confidence)
+            if inlier_idx is None:
+                # keep original if RANSAC failed
+                new_obj.append(objp)
+                new_img.append(imgp)
+                continue
+
+            ratio = len(inlier_idx) / len(objp)
+            if ratio < min_inlier_ratio:
+                # If too few inliers, skip this image entirely (likely a bad detection)
+                continue
+
+            kept += 1
+            if len(inlier_idx) != len(objp):
+                removed_pts += (len(objp) - len(inlier_idx))
+
+            # Subselect points
+            obj_in = objp[inlier_idx]
+            img_in = imgp[inlier_idx].reshape(-1, 1, 2)
+            new_obj.append(obj_in)
+            new_img.append(img_in)
+
+        if kept == 0 or len(new_obj) == 0:
+            # Nothing to refine; break
+            break
+
+        # Recalibrate with refined correspondences
+        rms, K, D, rvecs, tvecs = cv2.calibrateCamera(new_obj, new_img, image_size, None, None, flags=flags)
+        cur_obj, cur_img = new_obj, new_img
+        print(f"[RANSAC] Iter {it+1}: removed {removed_pts} outlier corners; using {len(cur_obj)} images. RMS now {rms:.6f}")
+
+    return rms, K, D, rvecs, tvecs, cur_obj, cur_img
+
+
+# --------------------------- Main -------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Camera calibration with a standard chessboard (from JSON)")
     ap.add_argument("--cfg", required=True, help="JSON exported by gen_chessboard_letter_pdf.py")
-    ap.add_argument("--folder", required=True, help="Folder containing jpg/png images")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--folder", help="Folder containing jpg/png images")
+    src.add_argument("--video", help="Path to a video file (e.g., mp4, avi, mkv)")
     ap.add_argument("--use_classic", action="store_true", help="Prefer findChessboardCorners")
     ap.add_argument("--min-frames", type=int, default=8, help="Minimum accepted images for calibration")
-    ap.add_argument("--save", default="calib.npz", help="Output npz (default: calib.npz)")
+    ap.add_argument("--save", default="calib.npz", help="Output npz (default: calib.npz)")    
+    
+    # RANSAC-related options
+    ap.add_argument("--ransac", action="store_true", help="Enable robust RANSAC outlier pruning and re-calibration")
+    ap.add_argument("--ransac-iters", type=int, default=3, help="Number of RANSAC->recalibrate refinement iterations (default: 2)")
+    ap.add_argument("--ransac-reproj", type=float, default=2.0, help="PnP RANSAC reprojection error threshold in pixels (default: 3.0)")
+    ap.add_argument("--ransac-conf", type=float, default=0.99, help="PnP RANSAC confidence (default: 0.99)")
+    ap.add_argument("--ransac-min-inlier", type=float, default=0.5, help="Minimum inlier ratio per image to keep it (default: 0.5)")
+    
     args = ap.parse_args()
 
     cfg = load_config(args.cfg)
@@ -117,62 +265,118 @@ def main():
     pattern_size = (nx, ny)
     objp = make_object_points(nx, ny, square_mm)
 
-    # Gather images
-    img_paths = collect_images(args.folder)
-    if not img_paths:
-        print(f"[ERR] No jpg/png images found in folder: {args.folder}")
-        sys.exit(1)
-
-    print(f"[INFO] Reading {len(img_paths)} images for chessboard calibration ({nx}x{ny} inner corners).")
+    # Gather sources
+    img_paths = []
+    use_video = args.video is not None
+    if not use_video:
+        img_paths = collect_images(args.folder)
+        if not img_paths:
+            print(f"[ERR] No jpg/png images found in folder: {args.folder}")
+            sys.exit(1)
+        print(f"[INFO] Reading {len(img_paths)} images for chessboard calibration ({nx}x{ny} inner corners).")
+    else:
+        print(f"[INFO] Reading frames from video: {args.video} for chessboard calibration ({nx}x{ny} inner corners).")
 
     objpoints = []  # (N_i,3)
     imgpoints = []  # (N_i,1,2)
     imsize = None
     used = 0
 
-    for p in img_paths:
-        img = cv2.imread(p)
-        if img is None:
-            print(f"[WARN] Cannot read: {p}")
-            continue
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (31,31), 0)
-        if imsize is None:
-            imsize = gray.shape[::-1]  # (w,h)
+    if not use_video:
+        for p in img_paths:
+            img = cv2.imread(p)
+            if img is None:
+                print(f"[WARN] Cannot read: {p}")
+                continue
+            gray = img[:,:,2]
+            gray = cv2.GaussianBlur(gray, (11,11), 0)
+            if imsize is None:
+                imsize = gray.shape[::-1]  # (w,h)
 
-        ok, corners = detect_chessboard(gray, pattern_size, use_classic=args.use_classic)
-        if not ok:
-            print(f"[WARN] {Path(p).name}: chessboard NOT found")
-            continue
+            ok, corners = detect_chessboard(gray, pattern_size, use_classic=args.use_classic)
+            if not ok:
+                print(f"[WARN] {Path(p).name}: chessboard NOT found")
+                continue
 
-        if args.use_classic or not hasattr(cv2, "findChessboardCornersSB"):
-            corners = subpix_refine(gray, corners)
+            if args.use_classic or not hasattr(cv2, "findChessboardCornersSB"):
+                corners = subpix_refine(gray, corners)
 
-        if corners is None or len(corners) != nx * ny:
-            print(f"[WARN] {Path(p).name}: invalid corner count ({0 if corners is None else len(corners)}), expected {nx*ny}")
-            continue
+            if corners is None or len(corners) != nx * ny:
+                print(f"[WARN] {Path(p).name}: invalid corner count ({0 if corners is None else len(corners)}), expected {nx*ny}")
+                continue
 
-        objpoints.append(objp.copy())
-        imgpoints.append(corners)
-        used += 1
+            objpoints.append(objp.copy())
+            imgpoints.append(corners)
+            used += 1
+    else:
+        for frame, idx in iter_video_frames(args.video, 0, None, 30):
+            gray = frame[:,:,2]
+            gray = cv2.GaussianBlur(gray, (5,5), 0)
+            if imsize is None:
+                imsize = gray.shape[::-1]  # (w,h)
+
+            ok, corners = detect_chessboard(gray, pattern_size, use_classic=args.use_classic)
+            if not ok:
+                print(f"[WARN] frame {idx}: chessboard NOT found")
+                continue
+
+            if args.use_classic or not hasattr(cv2, "findChessboardCornersSB"):
+                corners = subpix_refine(gray, corners)
+
+            if corners is None or len(corners) != nx * ny:
+                print(f"[WARN] frame {idx}: invalid corner count ({0 if corners is None else len(corners)}), expected {nx*ny}")
+                continue
+            
+            print(f"[WARN] frame {idx}: found chessboard successfully")
+            # vis = frame.copy()
+            # cv2.drawChessboardCorners(vis, pattern_size, corners, True)
+            # cv2.namedWindow("exam", cv2.WINDOW_NORMAL)
+            # cv2.resizeWindow("exam", 1280, 720)
+            # cv2.imshow("exam",vis)
+            # cv2.waitKey(10)
+            
+            objpoints.append(objp.copy())
+            imgpoints.append(corners)
+            used += 1
 
     if used < max(args.min_frames, 3):
         print(f"[ERR] Only {used} valid detections, need at least {max(args.min_frames, 3)}")
         sys.exit(2)
 
-    print(f"[INFO] Starting calibrateCamera with {used} valid images, image size {imsize}.")
-    flags = 0
-    # You could expose flags (e.g., FIX_K3) via CLI if desired.
-    rms, K, D, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, imsize, None, None, flags=flags)
+    print(f"[INFO] Initial calibrateCamera with {used} valid images, image size {imsize}.")
+    if args.ransac:
+        # Robust two-stage (or multi-iter) calibration
+        rms, K, D, rvecs, tvecs, obj_ref, img_ref = robust_refine_with_ransac(
+            objpoints, imgpoints, imsize,
+            iters=args.ransac_iters,
+            reproj_thresh=args.ransac_reproj,
+            confidence=args.ransac_conf,
+            min_inlier_ratio=args.ransac_min_inlier
+        )
+        # Compute per-image RMS on the refined set
+        per_img_rms = per_image_errors(obj_ref, img_ref, rvecs, tvecs, K, D)
+        mean_err = mean_reproj_error(obj_ref, img_ref, rvecs, tvecs, K, D)
+    else:
+        flags = (cv2.CALIB_FIX_K2 |
+         cv2.CALIB_FIX_K3 |
+         cv2.CALIB_ZERO_TANGENT_DIST |
+         cv2.CALIB_FIX_K4 |
+         cv2.CALIB_FIX_K5 |
+         cv2.CALIB_FIX_K6)
+        # flags=0
+        rms, K, D, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, imsize, None, None, flags=flags)
+        per_img_rms = per_image_errors(objpoints, imgpoints, rvecs, tvecs, K, D)
+        mean_err = mean_reproj_error(objpoints, imgpoints, rvecs, tvecs, K, D)
+    
+    for err in per_img_rms:
+        print(f"[PER-IMG RMS] = {err:.4f}")
 
-    mean_err = mean_reproj_error(objpoints, imgpoints, rvecs, tvecs, K, D)
+    print("\n=== Calibration Result ===")
+    print("RMS:", rms)
+    print("K:\n", K)
+    print("D:", D.ravel())
+    print("Mean reprojection error:", mean_err)
 
-    print(f"[RESULT] RMS = {rms:.6f}")
-    print(f"[RESULT] Mean reprojection error (pixels) = {mean_err:.6f}")
-    print(f"[RESULT] cameraMatrix =\n{K}")
-    print(f"[RESULT] distCoeffs   = {D.ravel()}")
-
-    # Save outputs
     out_npz = Path(args.save)
     out_npz.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out_npz,
